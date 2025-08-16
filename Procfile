@@ -1,0 +1,1 @@
+worker: python dkp_discord_bot.py
