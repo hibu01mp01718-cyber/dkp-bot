@@ -183,6 +183,29 @@ async def start_health_server(port: int):
     await site.start()
     logging.info(f"Health server running on port {port}")
 
+# ---------- auto_close_task function ----------
+async def auto_close_task(cli: DKPClient):
+    """Background task to auto-close expired loot auctions"""
+    await cli.wait_until_ready()  # Wait until the bot is ready
+    while not cli.is_closed():
+        try:
+            # Check for expired loot auctions and close them
+            async with cli.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM loot_auctions WHERE status='open' AND expires_at IS NOT NULL AND expires_at < now()"
+                )
+                for auction in rows:
+                    # Close the expired auction
+                    msg = await resolve_auction(conn, auction)
+                    guild = cli.get_guild(int(auction["guild_id"]))
+                    if guild:
+                        ch = guild.get_channel(int(auction["channel_id"]))
+                        if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                            await ch.send(msg)
+        except Exception as e:
+            logging.exception("Auto-close task error: %s", e)
+        await asyncio.sleep(20)  # Check every 20 seconds
+
 # ---------- Common checks ----------
 def mod_only():
     async def predicate(interaction: Interaction) -> bool:
