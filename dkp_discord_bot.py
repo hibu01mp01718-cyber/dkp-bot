@@ -27,6 +27,10 @@ Requirements (see requirements.txt)
 - aiohttp
 """
 
+import sys
+import types
+sys.modules['audioop'] = types.ModuleType('audioop')
+
 import os
 import asyncio
 import logging
