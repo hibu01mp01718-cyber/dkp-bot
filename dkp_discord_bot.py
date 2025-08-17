@@ -78,9 +78,9 @@ class DKPClient(discord.Client):
         self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         await self._create_tables()
 
-        # Clear and sync commands
+        # Sync slash commands
         if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
+            guild = discord.Object(id=int(GUILD_ID))  # Create a guild object from GUILD_ID
             await self.tree.clear_commands(guild=guild)  # Clear all guild commands
             await self.tree.sync(guild=guild)  # Sync for specific guild
             logging.info(f"Synced slash commands to guild {GUILD_ID}")
