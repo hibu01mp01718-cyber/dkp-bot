@@ -1,6 +1,7 @@
 import sys
 import types
 sys.modules['audioop'] = types.ModuleType('audioop')
+
 import discord
 from discord.ext import commands
 import psycopg2
@@ -20,7 +21,7 @@ intents.messages = True  # Enables message-related events (you can customize thi
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 # Connect to PostgreSQL
-conn = psycopg2.connect(os.getenv('DATABASE_URL'))
+conn = psycopg2.connect(os.getenv('DB_URL'))
 cursor = conn.cursor()
 
 # Create Tables if not exist (you can remove this if you're using an already created database)
