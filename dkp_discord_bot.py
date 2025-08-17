@@ -230,4 +230,4 @@ client.tree.add_command(eventpin_group)  # Register the eventpin group
 
 # ---------- Run ----------
 if __name__ == "__main__":
-   
+    client.run(DISCORD_TOKEN)  # This should be indented properly
