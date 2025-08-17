@@ -1,257 +1,124 @@
-import sys
-import types
-sys.modules['audioop'] = types.ModuleType('audioop')
-
-import os
-import asyncio
-import logging
-import random
-import string
-from typing import Literal
-from datetime import datetime, timedelta, timezone
-
 import discord
-from discord import app_commands, Interaction
-import asyncpg
-from aiohttp import web
-from dotenv import load_dotenv
+from discord.ext import commands
+import random
+import asyncio
+import psycopg2
+from psycopg2 import sql
+import os
 
-# ---------- Config & Logging ----------
-load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s: %(message)s"
-)
+# Setup
+intents = discord.Intents.default()
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+# Database connection (PostgreSQL)
 DATABASE_URL = os.getenv("DATABASE_URL")
-MOD_ROLE_NAME = os.getenv("MOD_ROLE", "Moderator")
-GUILD_ID = os.getenv("GUILD_ID")
-HEALTH_PORT = int(os.getenv("PORT", "8080"))  # Render sets PORT automatically
+conn = psycopg2.connect(DATABASE_URL)
+cursor = conn.cursor()
 
-if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is required")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is required (e.g., from Render Postgres)")
+# Helper functions
+def create_pin():
+    return random.randint(100000, 999999)
 
-# ---------- Helpers ----------
-def gen_code(n: int = 6) -> str:
-    alphabet = string.ascii_uppercase + string.digits
-    return "".join(random.choice(alphabet) for _ in range(n))
+def check_valid_pin(pin):
+    cursor.execute("SELECT * FROM pins WHERE pin = %s AND expiry > NOW()", (pin,))
+    return cursor.fetchone()
 
-async def ensure_user(pool: asyncpg.Pool, member: discord.abc.User | discord.Member):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO users (discord_id, username)
-            VALUES ($1, $2)
-            ON CONFLICT (discord_id)
-            DO UPDATE SET username = EXCLUDED.username,
-                          updated_at = now();
-            """,
-            int(member.id),
-            f"{member.name}#{member.discriminator}" if hasattr(member, "discriminator") else member.name,
-        )
+def add_dkp(user_id, points):
+    cursor.execute("INSERT INTO dkp (user_id, points) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET points = points + %s", (user_id, points, points))
+    conn.commit()
 
-async def has_mod_role(member: discord.Member) -> bool:
-    # Admins always pass
-    if getattr(member.guild_permissions, "administrator", False):
-        return True
-    return any(r.name == MOD_ROLE_NAME for r in getattr(member, "roles", []))
+def get_dkp(user_id):
+    cursor.execute("SELECT points FROM dkp WHERE user_id = %s", (user_id,))
+    result = cursor.fetchone()
+    return result[0] if result else 0
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+def get_leaderboard():
+    cursor.execute("SELECT user_id, points FROM dkp ORDER BY points DESC LIMIT 10")
+    return cursor.fetchall()
 
-# ---------- Client (no text-prefix commands = no message_content intent needed) ----------
-class DKPClient(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        # We use slash commands only; no need for message_content intent.
-        intents.guilds = True
-        intents.members = True  # Needed to read roles at interaction time (enable in Discord dev portal)
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-        self.pool: asyncpg.Pool | None = None
+# Events & Commands
 
-    async def setup_hook(self) -> None:
-        # Create DB pool and migrate
-        self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        await self._create_tables()
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user}')
 
-        # Sync slash commands
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))  # Create a guild object from GUILD_ID
-            await self.tree.clear_commands(guild=guild)  # Clear all guild commands
-            await self.tree.sync(guild=guild)  # Sync for specific guild
-            logging.info(f"Synced slash commands to guild {GUILD_ID}")
-        else:
-            await self.tree.clear_commands()  # Clear global commands
-            await self.tree.sync()  # Sync global commands
-            logging.info("Synced global slash commands (Discord may take up to ~1 hour to propagate)")
+# Create an event and generate a pin for it
+@bot.command()
+@commands.has_role("Moderator")
+async def create_event(ctx, event_name: str, points: int):
+    pin = create_pin()
+    cursor.execute("INSERT INTO events (event_name, points) VALUES (%s, %s)", (event_name, points))
+    cursor.execute("INSERT INTO pins (pin, event_name, expiry) VALUES (%s, %s, NOW() + INTERVAL '1 hour')", (pin, event_name))
+    conn.commit()
+    await ctx.send(f'Event "{event_name}" created with {points} points. PIN: {pin}')
 
-        # Start health server (so you can run as a Web Service on Render)
-        asyncio.create_task(start_health_server(HEALTH_PORT))
-        # Background task: auto-close expired auctions
-        asyncio.create_task(auto_close_task(self))
+# Member enters PIN to gain points
+@bot.command()
+async def enter_pin(ctx, pin: int):
+    user_id = ctx.author.id
+    valid_pin = check_valid_pin(pin)
+    
+    if valid_pin:
+        event_name = valid_pin[1]
+        points = valid_pin[2]
+        add_dkp(user_id, points)
+        await ctx.send(f'{ctx.author.mention} successfully gained {points} DKP points for {event_name}!')
+    else:
+        await ctx.send(f'Invalid or expired PIN. Please try again with a valid PIN.')
 
-    async def on_ready(self):
-        logging.info(f"Bot is ready. Logged in as {self.user} (id={self.user.id})")
+# Start loot bidding
+@bot.command()
+@commands.has_role("Moderator")
+async def start_loot(ctx, item_name: str, min_bid: int, increment: int, duration: int):
+    cursor.execute("INSERT INTO loot (item_name, min_bid, increment, duration, end_time) VALUES (%s, %s, %s, %s, NOW() + INTERVAL '%s minute') RETURNING id", (item_name, min_bid, increment, duration, duration))
+    loot_id = cursor.fetchone()[0]
+    conn.commit()
+    await ctx.send(f"Loot bidding for {item_name} has started! Minimum bid: {min_bid}, Increment: {increment}. Bidding ends in {duration} minutes.")
 
-    async def _create_tables(self):
-        async with self.pool.acquire() as conn:
-            # enable uuid generation
-            await conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto;")
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                  discord_id BIGINT PRIMARY KEY,
-                  username TEXT,
-                  dkp INTEGER NOT NULL DEFAULT 0,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
+# Place a bid for loot
+@bot.command()
+async def bid(ctx, amount: int):
+    user_id = ctx.author.id
+    loot_id = cursor.execute("SELECT id FROM loot WHERE end_time > NOW() ORDER BY end_time ASC LIMIT 1").fetchone()
+    
+    if not loot_id:
+        await ctx.send("No active loot bidding event found.")
+        return
 
-                CREATE TABLE IF NOT EXISTS event_types (
-                  id SERIAL PRIMARY KEY,
-                  name TEXT UNIQUE NOT NULL,
-                  points INTEGER NOT NULL CHECK (points >= 0),
-                  active BOOLEAN NOT NULL DEFAULT TRUE,
-                  created_at TIMESTAMPTZ DEFAULT now()
-                );
+    current_dkp = get_dkp(user_id)
+    
+    if amount < current_dkp and amount >= loot_id[1]:  # Check if bid is within limits
+        cursor.execute("INSERT INTO bids (user_id, loot_id, amount) VALUES (%s, %s, %s)", (user_id, loot_id[0], amount))
+        conn.commit()
+        await ctx.send(f'{ctx.author.mention} placed a bid of {amount} DKP for {loot_id[0]}!')
+    else:
+        await ctx.send(f"Invalid bid! Your current DKP: {current_dkp}, minimum bid: {loot_id[1]}.")
 
-                CREATE TABLE IF NOT EXISTS pins (
-                  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                  code TEXT UNIQUE NOT NULL,
-                  event_type_id INTEGER REFERENCES event_types(id) ON DELETE SET NULL,
-                  points INTEGER NOT NULL CHECK (points >= 0),
-                  expires_at TIMESTAMPTZ NOT NULL,
-                  created_by BIGINT NOT NULL,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                  active BOOLEAN NOT NULL DEFAULT TRUE
-                );
+# Determine the winner for loot bidding
+@bot.command()
+@commands.has_role("Moderator")
+async def close_bidding(ctx):
+    cursor.execute("SELECT loot_id, max(amount) FROM bids GROUP BY loot_id ORDER BY max(amount) DESC LIMIT 1")
+    highest_bid = cursor.fetchone()
+    
+    if highest_bid:
+        cursor.execute("SELECT user_id FROM bids WHERE loot_id = %s AND amount = %s", (highest_bid[0], highest_bid[1]))
+        winner_id = cursor.fetchone()[0]
+        winner = await bot.fetch_user(winner_id)
+        await ctx.send(f"{winner.mention} wins the loot with a bid of {highest_bid[1]} DKP!")
+    else:
+        await ctx.send("No bids placed yet!")
 
-                CREATE TABLE IF NOT EXISTS pin_redemptions (
-                  id BIGSERIAL PRIMARY KEY,
-                  pin_id UUID REFERENCES pins(id) ON DELETE CASCADE,
-                  user_id BIGINT REFERENCES users(discord_id) ON DELETE CASCADE,
-                  redeemed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                  UNIQUE (pin_id, user_id)
-                );
+# Leaderboard command
+@bot.command()
+async def leaderboard(ctx):
+    leaderboard = get_leaderboard()
+    leaderboard_message = "Top DKP Players:\n"
+    for idx, (user_id, points) in enumerate(leaderboard):
+        user = await bot.fetch_user(user_id)
+        leaderboard_message += f"{idx+1}. {user.name} - {points} DKP\n"
+    await ctx.send(leaderboard_message)
 
-                CREATE TABLE IF NOT EXISTS loot_auctions (
-                  id BIGSERIAL PRIMARY KEY,
-                  guild_id BIGINT NOT NULL,
-                  channel_id BIGINT NOT NULL,
-                  item_name TEXT NOT NULL,
-                  min_bid INTEGER NOT NULL CHECK (min_bid >= 0),
-                  increment INTEGER NOT NULL CHECK (increment >= 1),
-                  style TEXT NOT NULL CHECK (style IN ('blind','fixed','zerosum')),
-                  expires_at TIMESTAMPTZ,
-                  created_by BIGINT NOT NULL,
-                  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed','cancelled')),
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-
-                CREATE TABLE IF NOT EXISTS bids (
-                  id BIGSERIAL PRIMARY KEY,
-                  auction_id BIGINT REFERENCES loot_auctions(id) ON DELETE CASCADE,
-                  user_id BIGINT REFERENCES users(discord_id) ON DELETE CASCADE,
-                  amount INTEGER NOT NULL CHECK (amount >= 0),
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                  UNIQUE (auction_id, user_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS loot_awards (
-                  id BIGSERIAL PRIMARY KEY,
-                  auction_id BIGINT UNIQUE REFERENCES loot_auctions(id) ON DELETE CASCADE,
-                  winner_id BIGINT REFERENCES users(discord_id) ON DELETE SET NULL,
-                  amount INTEGER NOT NULL,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-                """
-            )
-
-# ---------- Health server for Render ----------
-async def handle_health(request):
-    return web.Response(text="ok")
-
-async def start_health_server(port: int):
-    app = web.Application()
-    app.add_routes([web.get('/', handle_health)])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info(f"Health server running on port {port}")
-
-# ---------- auto_close_task function ----------
-async def auto_close_task(cli: DKPClient):
-    """Background task to auto-close expired loot auctions"""
-    await cli.wait_until_ready()  # Wait until the bot is ready
-    while not cli.is_closed():
-        try:
-            # Check for expired loot auctions and close them
-            async with cli.pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT * FROM loot_auctions WHERE status='open' AND expires_at IS NOT NULL AND expires_at < now()"
-                )
-                for auction in rows:
-                    # Close the expired auction
-                    msg = await resolve_auction(conn, auction)
-                    guild = cli.get_guild(int(auction["guild_id"]))
-                    if guild:
-                        ch = guild.get_channel(int(auction["channel_id"]))
-                        if isinstance(ch, (discord.TextChannel, discord.Thread)):
-                            await ch.send(msg)
-        except Exception as e:
-            logging.exception("Auto-close task error: %s", e)
-        await asyncio.sleep(20)  # Check every 20 seconds
-
-# ---------- Common checks ----------
-def mod_only():
-    async def predicate(interaction: Interaction) -> bool:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await safe_reply(interaction, "This command must be used in a server.", ephemeral=True)
-            return False
-        if not await has_mod_role(interaction.user):
-            await safe_reply(interaction, f"You need the '{MOD_ROLE_NAME}' role.", ephemeral=True)
-            return False
-        return True
-    return app_commands.check(predicate)
-
-async def safe_reply(interaction: Interaction, content: str, ephemeral: bool = False):
-    """Avoid 'application did not respond' by deferring when needed."""
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(content, ephemeral=ephemeral)
-        else:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
-    except Exception:
-        # last resort
-        try:
-            await interaction.followup.send(content, ephemeral=ephemeral)
-        except Exception:
-            pass
-
-# ---------- eventpin group ----------
-eventpin_group = app_commands.Group(name="eventpin", description="Manage event PINs")
-
-@eventpin_group.command(name="create", description="Create a new PIN for an event")
-@mod_only()
-async def eventpin_create(interaction: Interaction, event_name: str, duration_minutes: app_commands.Range[int, 1, 1440]):
-    """Command to create an event PIN"""
-    code = gen_code()  # Assuming gen_code() generates a random PIN
-    await interaction.response.send_message(f"PIN created for event {event_name} with {duration_minutes} minutes duration.", ephemeral=True)
-
-@eventpin_group.command(name="list", description="List all active event PINs")
-async def eventpin_list(interaction: Interaction):
-    """Command to list event pins"""
-    await interaction.response.send_message("Here are the active event pins.", ephemeral=True)
-
-# Register the eventpin group
-client = DKPClient()  # Instantiate the client here
-client.tree.add_command(eventpin_group)  # Register the eventpin group
-
-# ---------- Run ----------
-if __name__ == "__main__":
-    client.run(DISCORD_TOKEN)  # This should be indented properly
+# Run bot
+bot.run('YOUR_BOT_TOKEN')
