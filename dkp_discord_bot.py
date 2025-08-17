@@ -1,7 +1,3 @@
-import sys
-import types
-sys.modules['audioop'] = types.ModuleType('audioop')
-
 import discord
 from discord.ext import commands
 import psycopg2
@@ -13,8 +9,12 @@ from datetime import datetime, timedelta
 
 load_dotenv()
 
-# Bot Setup
-bot = commands.Bot(command_prefix="/")
+# Set up intents
+intents = discord.Intents.default()
+intents.messages = True  # Enables message-related events (you can customize this further as needed)
+
+# Bot Setup with intents
+bot = commands.Bot(command_prefix="/", intents=intents)
 
 # Connect to PostgreSQL
 conn = psycopg2.connect(os.getenv('DB_URL'))
