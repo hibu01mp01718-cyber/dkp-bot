@@ -78,14 +78,15 @@ class DKPClient(discord.Client):
         self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         await self._create_tables()
 
-        # Sync slash commands (fast if GUILD_ID set for guild-specific commands)
+        # Clear and sync commands
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+            await self.tree.clear_commands(guild=guild)  # Clear all guild commands
+            await self.tree.sync(guild=guild)  # Sync for specific guild
             logging.info(f"Synced slash commands to guild {GUILD_ID}")
         else:
-            await self.tree.sync()
+            await self.tree.clear_commands()  # Clear global commands
+            await self.tree.sync()  # Sync global commands
             logging.info("Synced global slash commands (Discord may take up to ~1 hour to propagate)")
 
         # Start health server (so you can run as a Web Service on Render)
