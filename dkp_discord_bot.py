@@ -185,6 +185,32 @@ async def start_health_server(port: int):
     await site.start()
     logging.info(f"Health server running on port {port}")
 
+# ---------- Define the mod_only Decorator ----------
+def mod_only():
+    async def predicate(interaction: Interaction) -> bool:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await safe_reply(interaction, "This command must be used in a server.", ephemeral=True)
+            return False
+        if not await has_mod_role(interaction.user):
+            await safe_reply(interaction, f"You need the '{MOD_ROLE_NAME}' role.", ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
+
+async def safe_reply(interaction: Interaction, content: str, ephemeral: bool = False):
+    """Avoid 'application did not respond' by deferring when needed."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+    except Exception:
+        # last resort
+        try:
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        except Exception:
+            pass
+
 # ---------- PIN Commands (Including the new 'eventpin') ----------
 
 pin = app_commands.Group(name="pin", description="Generate and manage event PINs")
