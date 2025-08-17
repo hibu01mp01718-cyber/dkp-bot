@@ -290,6 +290,26 @@ async def eventpin_create(interaction: Interaction, event_name: str, points: app
 
 client.tree.add_command(pin)
 
+# ---------- Auction Auto-Close Task ----------
+async def auto_close_task(cli: DKPClient):
+    await cli.wait_until_ready()
+    while not cli.is_closed():
+        try:
+            async with cli.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM loot_auctions WHERE status='open' AND expires_at IS NOT NULL AND expires_at < now()"
+                )
+                for a in rows:
+                    msg = await resolve_auction(conn, a)
+                    guild = cli.get_guild(int(a["guild_id"]))
+                    if guild:
+                        ch = guild.get_channel(int(a["channel_id"]))
+                        if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                            await ch.send(msg)
+        except Exception as e:
+            logging.exception("Auto-close task error: %s", e)
+        await asyncio.sleep(20)
+
 # ---------- Run ----------
 if __name__ == "__main__":
     client.run(DISCORD_TOKEN)
