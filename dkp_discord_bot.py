@@ -1,3 +1,8 @@
+import sys
+import types
+sys.modules['audioop'] = types.ModuleType('audioop')
+
+
 import discord
 from discord import app_commands
 from discord.ext import commands
