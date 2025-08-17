@@ -209,54 +209,6 @@ async def safe_reply(interaction: Interaction, content: str, ephemeral: bool = F
         except Exception:
             pass
 
-# ---------- /points, /leaderboard, /loot_history ----------
-@client.tree.command(description="Show your DKP or someone else's")
-@app_commands.describe(user="User to inspect (optional)")
-async def points(interaction: Interaction, user: discord.Member | None = None):
-    await interaction.response.defer(ephemeral=True)
-    target = user or interaction.user
-    async with client.pool.acquire() as conn:
-        await ensure_user(client.pool, target)
-        row = await conn.fetchrow("SELECT dkp FROM users WHERE discord_id=$1", int(target.id))
-    await interaction.followup.send(f"**{target.display_name}** has **{row['dkp']} DKP**.", ephemeral=True)
-
-@client.tree.command(description="Top DKP holders (top 10)")
-async def leaderboard(interaction: Interaction):
-    await interaction.response.defer()
-    async with client.pool.acquire() as conn:
-        rows = await conn.fetch("SELECT username, dkp FROM users ORDER BY dkp DESC NULLS LAST LIMIT 10")
-    if not rows:
-        await interaction.followup.send("No data yet.")
-        return
-    msg = "**DKP Leaderboard**\n" + "\n".join(f"{i+1}. {r['username']}: {r['dkp']}" for i, r in enumerate(rows))
-    await interaction.followup.send(msg)
-
-@client.tree.command(description="Recent loot awards (last 10)")
-async def loot_history(interaction: Interaction):
-    await interaction.response.defer(ephemeral=False)
-    async with client.pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT la.id, la.amount, la.created_at, u.username, a.item_name
-            FROM loot_awards la
-            JOIN loot_auctions a ON a.id = la.auction_id
-            LEFT JOIN users u ON u.discord_id = la.winner_id
-            WHERE a.guild_id = $1
-            ORDER BY la.created_at DESC
-            LIMIT 10
-            """,
-            int(interaction.guild_id),
-        )
-    if not rows:
-        await interaction.followup.send("No loot awards yet.")
-        return
-    lines = [
-        f"#{r['id']} • {r['item_name']} → {r['username'] or 'Unknown'} "
-        f"({r['amount']} DKP) • {r['created_at'].strftime('%Y-%m-%d %H:%M UTC')}"
-        for r in rows
-    ]
-    await interaction.followup.send("**Recent Loot**\n" + "\n".join(lines))
-
 # ---------- eventpin group ----------
 eventpin_group = app_commands.Group(name="eventpin", description="Manage event PINs")
 
@@ -272,8 +224,10 @@ async def eventpin_list(interaction: Interaction):
     """Command to list event pins"""
     await interaction.response.send_message("Here are the active event pins.", ephemeral=True)
 
+# Register the eventpin group
+client = DKPClient()  # Instantiate the client here
 client.tree.add_command(eventpin_group)  # Register the eventpin group
 
 # ---------- Run ----------
 if __name__ == "__main__":
-    client.run(DISCORD_TOKEN)
+   
